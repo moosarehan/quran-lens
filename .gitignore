@@ -1,0 +1,17 @@
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+data/*.sqlite*
+data/qdrant/
+data/models/
+*.egg-info/
+data/uv-cache/
+data/test-tmp/
+data/indexing*.log
+data/indexing.pid
+data/*-verification.json
+data/*-comparison.json
+data/follow-up-memory-test.json
+quran-rag-frontend/node_modules/
+quran-rag-frontend/dist/
