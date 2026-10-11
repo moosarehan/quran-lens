@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quran-rag"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "httpx>=0.27,<1",
+  "langchain-core>=1,<2", "langchain-groq>=1,<2", "langchain-google-genai>=4,<5", "langchain-openai>=1,<2", "langgraph>=1,<2",
+  "langgraph-checkpoint-sqlite>=3,<4", "qdrant-client>=1.12,<2",
+  "rank-bm25>=0.2.2,<1", "python-dotenv>=1,<2"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+include = ["quran_rag*"]
+
