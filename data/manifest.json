@@ -1,0 +1,20 @@
+{
+  "downloaded_at": "2026-10-08T10:47:05.626095+00:00",
+  "files": {
+    "quran-uthmani.txt": {
+      "url": "https://tanzil.net/pub/download/index.php?quranType=uthmani&outType=txt-2&agree=true&marks=true&sajdah=true&tatweel=true",
+      "sha256": "6933e133dd56db778c801bf738848454e43648105a151e8d84d86a7cae39ec5f",
+      "bytes": 1396087
+    },
+    "en.sahih.txt": {
+      "url": "https://tanzil.net/trans/?transID=en.sahih&type=txt-2",
+      "sha256": "a1778a1a56695d9b59ae910809ec46d9f4a55f05961de51cd56e6ebcf9040883",
+      "bytes": 898049
+    },
+    "quran-data.xml": {
+      "url": "https://tanzil.net/res/text/metadata/quran-data.xml",
+      "sha256": "8867c1d88191472adec9db694b3cd9f135b1a2ef580574d32cf888dcb22c5c7a",
+      "bytes": 77234
+    }
+  }
+}
