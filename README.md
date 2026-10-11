@@ -1,119 +1,281 @@
-# Quran RAG backend
+# Quran Lens
 
-Python 3.11+, FastAPI, LangGraph, SQLite, Qdrant, BM25, Cloudflare multilingual embeddings and Hugging Face, Cloudflare, Gemini or Groq text generation.
+**Quran Lens** is a bilingual Quran research chatbot built with React, FastAPI, LangChain and LangGraph. It retrieves original Arabic verses and their Saheeh International English translation, then produces answers grounded in those records with verse citations.
 
-## Setup (PowerShell)
+The project uses a **traditional retrieval-augmented generation (RAG) system**: load documents, index them, retrieve evidence for a question, augment the model prompt with that evidence, and generate an answer. The model is not fine-tuned on the Quran. LangGraph coordinates a fixed `route → retrieve → generate` workflow.
 
-Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in .env.
-For Hugging Face text generation, set TEXT_GENERATION_PROVIDER=huggingface, HF_TOKEN and HF_MODEL=openai/gpt-oss-120b:cerebras. LangChain ChatOpenAI uses the Hugging Face inference router, with native JSON-schema structured output. HF_REVIEW_MODEL optionally selects a separate evidence-review model. Inference credits and a token with Inference Providers permission are required. HTTP 402 reports insufficient credits; changing models cannot replenish the shared account balance. Embeddings continue to use Cloudflare BGE-M3 and the existing Qdrant index.
-For Cloudflare text generation, set TEXT_GENERATION_PROVIDER=cloudflare and CLOUDFLARE_TEXT_MODEL=@cf/openai/gpt-oss-120b. The same Workers AI credentials serve embeddings and text generation. LangChain ChatOpenAI uses Cloudflare's OpenAI-compatible endpoint. GPT-OSS structured calls use native ChatPromptTemplate and PydanticOutputParser, with one bounded correction that receives the actual schema-validation error; Cloudflare does not consistently force tool calls and does not document GPT-OSS JSON mode. Draft generation is non-streaming upstream, and validated answer text is delivered through the existing SSE endpoint.
-For Gemini, set TEXT_GENERATION_PROVIDER=gemini, GEMINI_API_KEY and GEMINI_MODEL. GEMINI_REVIEW_MODEL and GEMINI_REVIEW_FALLBACK_MODELS configure evidence review separately. Gemini uses native JSON-schema structured output, bounded rate-limit retries and configured model fallbacks; embeddings remain on Cloudflare.
-For Groq, set TEXT_GENERATION_PROVIDER=groq and GROQ_API_KEY.
-Model access and free quotas depend on the provider account; listing a model does not guarantee generation quota.
-Use EMBEDDING_MODEL=@cf/baai/bge-m3.
+Exact references, literal searches and counts also have a deterministic lookup path, so these operations do not depend on vector similarity or model-estimated counts.
+
+## Features
+
+- All 114 surahs and 6,236 numbered ayahs, with aligned Arabic and English text.
+- Exact ayah, range and full-surah lookup.
+- Literal Arabic/English word and phrase searches.
+- Arabic lemma-based frequency counts using morphology annotations.
+- Hybrid retrieval for themes, teachings and Quran narratives.
+- Cited explanations and chapter summaries using canonical evidence.
+- Neighboring ayahs for context in explicit verse explanations.
+- Persistent chats with unique thread IDs, restoration, renaming and deletion.
+- React frontend and server-sent events (SSE) for progress and answer delivery.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    D[Tanzil text and metadata] --> L[TanzilLoader: one document per ayah]
+    L --> S[SQLite canonical verse store]
+    S --> E[Cloudflare BGE-M3 embeddings]
+    E --> Q[Qdrant Arabic and English collections]
+    S --> B[English BM25 index]
+    U[User question / React] --> A[FastAPI]
+    A --> R[LangGraph routing]
+    R --> X[Exact and literal lookup]
+    R --> H[Hybrid retrieval]
+    Q --> H
+    B --> H
+    X --> C[Canonical evidence and context]
+    H --> C
+    C --> G[Direct formatting or Gemini generation and review]
+    G --> O[Cited answer and verse records]
+    O --> U
+    A <--> P[SQLite checkpoints]
+```
+
+## 1. Dataset: where the documents came from
+
+The Arabic text, English translation and surah metadata were downloaded from the **Tanzil Project**. Morphology comes from the **Quranic Arabic Corpus v0.4**, obtained through a CLTK mirror of the original download.
+
+| File | Content | Source |
+| --- | --- | --- |
+| `data/quran-uthmani.txt` | Arabic Quran in Uthmani script | [Tanzil Quran text](https://tanzil.net/pub/download/index.php?quranType=uthmani&outType=txt-2&agree=true&marks=true&sajdah=true&tatweel=true) |
+| `data/en.sahih.txt` | Saheeh International English translation | [Tanzil translation](https://tanzil.net/trans/?transID=en.sahih&type=txt-2) |
+| `data/quran-data.xml` | Chapter names, numbers and verse counts | [Tanzil metadata](https://tanzil.net/res/text/metadata/quran-data.xml) |
+| `data/morphology/quranic-corpus-morphology-0.4.txt` | Arabic morphology annotations | [Original corpus download page](https://corpus.quran.com/download/) |
+
+`download.py` fetches the Tanzil files, rejects unexpected HTML, validates the aligned dataset and records URLs, download time, file sizes and SHA-256 hashes in `data/manifest.json`. Source files remain unchanged.
+
+Read [data/ATTRIBUTION.md](data/ATTRIBUTION.md) for usage terms. Tanzil Quran text requires verbatim preservation and attribution. Translation download terms specify non-commercial use; commercial use requires permission from the translator or publisher. The morphology file retains its embedded copyright and license notices.
+
+## 2. Document loader
+
+`TanzilLoader` in `quran_rag/loader.py` extends LangChain's `BaseLoader` and produces LangChain `Document` objects.
+
+It parses `surah|ayah|text` records, rejects duplicate keys, aligns Arabic and English by `surah:ayah`, and validates every expected key against the complete 114-surah metadata. Each document contains one ayah and its translation.
+
+Metadata includes the verse key, chapter/ayah numbers, Arabic and English surah names, canonical Arabic text, translation, translation identity and source URL. Unnumbered opening formulas prepended to first ayahs are separated into `opening_header` metadata while the raw source stays unchanged.
+
+## 3. Text splitter and chunking strategy
+
+**There is no character-based text splitter in this project.** The loader performs natural segmentation into one complete numbered ayah per document.
+
+This keeps verse boundaries intact and preserves accurate citations and bilingual alignment. Arbitrary character chunks would split canonical verses and complicate exact lookup.
+
+When a question needs context, retrieval adds neighboring ayahs or connected passages at query time. Long chapter summaries use bounded source batches and representative evidence selection; the stored documents remain individual ayahs.
+
+## 4. Canonical storage and vector indexing
+
+`VerseStore` in `store.py` stores canonical records in `data/quran.sqlite`, keyed by chapter and ayah. A chapter/ayah index supports ordered range lookup. Canonical text returned to users comes from this store.
+
+Ingestion builds two Qdrant collections:
+
+- **English:** vectors of the English translations.
+- **Arabic:** vectors of the numbered original Arabic ayahs.
+
+A complete bilingual index has **6,236 vectors per language: 12,472 vectors total**. Qdrant payloads identify verses and record language/model/fingerprint information; SQLite supplies the full canonical records.
+
+Model, engine and text fingerprints determine whether saved vectors can be reused. Indexing skips compatible records, processes pending ones in batches and resumes saved progress after interruption. Changing the embedding pipeline requires compatible reindexing, rather than assuming vectors from any provider are interchangeable.
+
+## 5. Embedding model
+
+The embedding model is **BAAI BGE-M3**, accessed through **Cloudflare Workers AI** with model identifier:
+
+```text
+@cf/baai/bge-m3
+```
+
+`CloudflareEmbeddings` implements LangChain's `Embeddings` interface. Both ingestion and runtime queries use this API. The adapter checks that returned vectors have 1,024 finite dimensions and applies bounded retries for temporary failures.
+
+The application does not need local embedding weights or an embedding model loaded into RAM. For each hybrid search invocation, the query is embedded once and that vector searches both language collections. Expanded query variants can trigger additional search invocations.
+
+## 6. Routing and SQLite-backed lookup retriever
+
+`graph.py` first parses recognizable explicit requests deterministically. Other requests use an LLM-generated structured plan validated with Pydantic. `catalog.py` resolves surahs through all 114 chapters' metadata.
+
+| Request | Retrieval operation | Example |
+| --- | --- | --- |
+| Exact ayah or range | Canonical ordered lookup | `Show me 2:255` |
+| Chapter or subset | Chapter lookup | `Show the last verse of Surah Al-Baqarah` |
+| Literal word/phrase | Exhaustive matching over stored text | `Find verses containing الذين آمنوا وعملوا الصالحات` |
+| Frequency count | Arabic morphology or surface-token count | `How many times does forgiveness appear?` |
+| Explicit explanation | Requested ayah and adjacent context | `Explain 2:55 in easy words` |
+| Surah summary | Chapter records and bounded evidence processing | `Summarize Surah 1` |
+| Theme or narrative | Hybrid semantic/lexical retrieval | `What does the Quran say about being kind to parents?` |
+
+SQLite-backed lookup is not always a single SQL text-search statement. References and ranges use SQL; some literal operations scan normalized canonical records in Python; morphology counts use the corpus annotations.
+
+### Word-frequency counting
+
+Frequency questions count the **Arabic Quran**, not English translation occurrences. For English input, the model can resolve a complete word or expression to one Arabic dictionary lemma. The application validates that resolution and computes the count deterministically.
+
+Lemma counts include annotated inflections and attached clitics of that lemma. They do not automatically combine every derived word sharing its root. Results distinguish occurrences from distinct verses. Explicit surface requests use written-token matching instead.
+
+The LLM resolves meaning; it does not calculate or estimate the count. Genuinely ambiguous expressions may need clarification.
+
+## 7. Hybrid retriever: BM25 + bilingual dense search + RRF
+
+`HybridRetriever` combines three ranked lists:
+
+1. **English BM25**, implemented with `rank_bm25.BM25Okapi`, for lexical matching against the translation.
+2. **English dense retrieval**, using Qdrant cosine similarity over translation vectors.
+3. **Arabic dense retrieval**, using the same multilingual query vector against Arabic vectors.
+
+The results are merged with **reciprocal rank fusion (RRF)**:
+
+```text
+RRF score(verse) = sum(1 / (60 + rank))
+```
+
+Verses ranked well in several lists receive stronger combined scores. Results are deduplicated by verse key, and canonical records are fetched from SQLite.
+
+The graph can expand questions into focused English search variants, combine rankings, assess relevance and select supporting evidence. Narrative queries can inspect wider canonical context and select connected ranges. These operations use the question and evidence rather than fixed passages for individual example stories.
+
+There is no enabled dedicated cross-encoder reranker in the default path. Structured relevance and evidence assessments supplement retrieval but are distinct from a cross-encoder model.
+
+Hybrid search is designed for relevant evidence, not guaranteed exhaustive coverage. Literal lists and frequency counts use the lookup path.
+
+## 8. Augmentation: supplying evidence to the model
+
+After retrieval, the system builds a prompt containing the question, canonical Arabic text, English translation, verse identifiers and relevant notices. Instructions constrain generation to the supplied evidence and permitted `[surah:ayah]` citations.
+
+An explicit verse explanation adds one neighboring ayah on each side, clipped to the same surah. The explanation focuses on the requested ayah and cites neighbors when statements depend on them.
+
+Surah summaries begin with canonical chapter records. Large chapters are processed in bounded sections with supporting canonical verse selection. `RAG_SOURCE_MAX_CHARS` controls the source budget. Intermediate selection prose is not treated as canonical Quran evidence.
+
+This evidence-enriched prompt is the augmentation step in traditional RAG.
+
+## 9. Generation model and evidence validation
+
+The current local configuration selects **Google Gemini**, with **`gemini-3.5-flash-lite`** as the primary generation model. `GEMINI_MODEL` controls this choice. The committed `.env.example` provides configurable primary, fallback and review model settings; it does not contain credentials.
+
+`provider.py` uses LangChain `ChatGoogleGenerativeAI` for Gemini, structured output, validation, bounded retries and fallbacks. It also retains Groq, Hugging Face and Cloudflare text adapters. The current setup uses Gemini generation and Cloudflare embeddings.
+
+Explanatory answers are generated as structured statements with supporting verse IDs. The workflow checks allowed citations and quotations and uses a configured reviewer to assess claims against their cited evidence. Bounded corrections repair invalid evidence or unsupported drafts; unverified drafts are withheld.
+
+Exact verse displays and literal results can be formatted directly from canonical records. A model may still participate in routing or expression translation, so a lookup request does not necessarily mean zero LLM calls.
+
+Only Quran text and the stored translation supply answer evidence. The system does not retrieve scholarly tafsir or historical reports about occasions of revelation. It should abstain when the requested information is absent instead of supplementing it from model memory. These checks reduce errors but do not establish perfect accuracy.
+
+## 10. Persistent chats and streaming
+
+Every chat has a unique `thread_id`. LangGraph's `SqliteSaver` persists messages and state in `data/checkpoints.sqlite`. The backend lists unique threads from checkpoints, restores history using `graph.get_state`, updates titles through graph state and deletes chats using `delete_thread`.
+
+**Persistence and follow-up interpretation are separate.** The current router treats each question independently and does not infer missing references from previous turns. Saved chats can be reopened, but an ambiguous follow-up such as `explain it` is not a supported reference-resolution feature. Use an explicit question such as `Explain 2:55 in easy words`.
+
+`POST /chat/stream` sends SSE progress events during execution. Generated drafts are checked before the final answer is delivered through `answer_token` events. This streams a validated answer rather than exposing unreviewed generation tokens. Other events include `result`, `done` and `error`.
+
+## Project components
+
+| Component | Responsibility |
+| --- | --- |
+| `quran_rag/api.py` | FastAPI endpoints, SSE and checkpoint-based chat operations |
+| `quran_rag/catalog.py` | Surah metadata and name resolution |
+| `quran_rag/config.py` | Environment loading, paths and collection identities |
+| `quran_rag/download.py` | Dataset download, validation and provenance |
+| `quran_rag/loader.py` | Ayah-aligned LangChain document loading |
+| `quran_rag/ingest.py` | Canonical ingestion and bilingual indexing |
+| `quran_rag/embeddings.py` | Cloudflare BGE-M3 adapter |
+| `quran_rag/retriever.py` | BM25, Qdrant search and bilingual RRF |
+| `quran_rag/store.py` | Canonical lookup, literal matching and counts |
+| `quran_rag/morphology.py` | Arabic corpus annotation handling |
+| `quran_rag/graph.py` | Routing, augmentation, generation and review |
+| `quran_rag/provider.py` | Model clients, structured output and fallbacks |
+| `quran-rag-frontend/` | React interface built with Vite |
+| `pyproject.toml` / `uv.lock` | Python dependencies and reproducible installation |
+
+LangChain provides document/embedding interfaces, model integrations and structured-output utilities. LangGraph provides workflow execution and checkpoints. Quran-specific validation, morphology, routing and bilingual RRF remain application logic.
+
+## Run locally
+
+Requirements: Python 3.11+, `uv`, Node.js/npm, Cloudflare Workers AI credentials and a Gemini key with access to the configured models.
+
+### Install and configure
+
+From the project root in PowerShell:
 
 ```powershell
 uv sync --locked
+Copy-Item .env.example .env
+```
+
+Set `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` and `GEMINI_API_KEY` in `.env`. Select `TEXT_GENERATION_PROVIDER=gemini`, choose an accessible `GEMINI_MODEL`, and configure generation/review fallbacks. Keep `EMBEDDING_MODEL=@cf/baai/bge-m3` for this embedding pipeline.
+
+Model availability and quota depend on the account. Credentials belong only in the backend `.env`.
+
+### Prepare the corpus and index
+
+The source corpus is included. To download and validate the Tanzil files again:
+
+```powershell
+.venv/Scripts/python.exe -m quran_rag.download
+```
+
+Populate SQLite and both vector collections:
+
+```powershell
 .venv/Scripts/python.exe -m quran_rag.ingest --batch-size 32
+```
+
+Add `--sql-only` for canonical ingestion without embeddings. Hybrid queries require the complete bilingual index. Stop the API before indexing with local Qdrant: its storage cannot be opened by both processes simultaneously.
+
+### Start the backend
+
+```powershell
 .venv/Scripts/python.exe -m uvicorn quran_rag.api:app --host 127.0.0.1 --port 8000
 ```
 
-Embeddings run on Cloudflare Workers AI. No local weights, tokenizer, PyTorch
-inference or embedding prewarming are needed. Both Arabic and English texts are
-embedded with the same API used for runtime queries. A complete index contains
-6,236 vectors per language. Cloudflare collections have separate fingerprints
-from the previous local int8 collections. Stop the API before local Qdrant ingestion.
-Indexing resumes from saved batches after interruption. API quotas, network errors
-and provider outages can still interrupt requests; transient errors receive bounded
-retries. Credentials stay in the backend .env, never in the React application.
+API documentation: <http://127.0.0.1:8000/docs>.
 
-API documentation: http://127.0.0.1:8000/docs
+### Start the frontend
 
-## Endpoints
+In another terminal:
 
-- GET `/health`: corpus count, per-language vector counts, and bilingual index readiness.
-- GET `/verses/2/44`: canonical Arabic, English and metadata.
-- GET `/search/word?word=sun`: exhaustive whole-word English matches for listing verses.
-- GET `/search/word/count?word=مغفرة`: Arabic-only frequency count, matching verse count, canonical records and matching method.
-- POST `/chat`: JSON answer, canonical verse records and notices.
-- POST `/chat/stream`: SSE status events, validated answer text, final result and done.
+```powershell
+cd quran-rag-frontend
+npm install
+npm run dev
+```
+
+Open the Vite URL, usually <http://127.0.0.1:5173>. Vite proxies `/api` requests to port 8000. Build with `npm run build`.
+
+## API endpoints
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| GET | `/health` | Corpus size, vector counts and readiness |
+| GET | `/verses/{surah}/{ayah}` | Canonical verse |
+| GET | `/search/word?word=patience` | English whole-word matches |
+| GET | `/search/word/count?word=مغفرة` | Arabic count; optional `mode=surface` |
+| POST | `/chat` | Answer and canonical evidence as JSON |
+| POST | `/chat/stream` | SSE progress and validated answer delivery |
+| GET / POST | `/conversations` | List threads or create a chat |
+| GET / PATCH / DELETE | `/conversations/{key}` | Restore, rename or delete |
 
 Example:
 
 ```powershell
-$body = @{question='What does the Quran say about patience?'; thread_id='my-chat'} | ConvertTo-Json
+$body = @{
+    question = 'What does the Quran say about being kind to parents?'
+    thread_id = 'my-chat'
+} | ConvertTo-Json
 Invoke-RestMethod http://127.0.0.1:8000/chat -Method Post -ContentType application/json -Body $body
 ```
 
-Reuse a thread_id to continue the conversation. Use a new thread_id for a new conversation. SSE event types are `status`, `answer_token`, `result`, `done`, and `error`. Thematic answers, explanations and summaries may faithfully paraphrase the stored translation, with citations for every factual paragraph. Canonical Arabic and English records remain unchanged and are returned separately. Evidence review reads both languages, explicitly compares actors, recipients, conditions and amounts, and checks exact English evidence spans. TEXT_REVIEW_REASONING_EFFORT configures GPT-OSS review reasoning; TEXT_ANSWER_REASONING_EFFORT configures final-answer reasoning while retrieval planning remains lightweight. At most two evidence-based answer repairs are permitted; malformed reviewer evidence has its own bounded correction. Generated answers use a typed, bounded set of short statements and attached verse IDs. Draft text stays private while local citation/quotation checks and a source-grounded model review run. Review evidence must match exact spans in each claim's own cited verses. Invalid review evidence is corrected separately; unsupported answer claims receive a bounded repair. Unverified drafts are withheld. Status events stream during execution, followed by the checked final answer and result. These checks reduce errors but do not establish perfect accuracy; live answers still require evaluation.
+Reuse the thread ID to save messages in one chat. A new ID creates separate state. Responses include answer text, canonical verse records, notices and applicable count or opening-header metadata.
 
-## Storage and retrieval
+## Storage and limitations
 
-- `data/quran-uthmani.txt`, `data/en.sahih.txt`, `data/quran-data.xml`: unmodified Tanzil sources.
-- `data/manifest.json`: download URLs, timestamps and SHA-256 hashes.
-- `data/quran.sqlite`: canonical metadata/text, one row per ayah.
-- `data/qdrant/`: persistent local vectors (or configure QDRANT_URL).
-- `data/checkpoints.sqlite`: separate durable LangGraph state.
+`data/quran.sqlite` contains canonical records, `data/qdrant/` contains local vectors and `data/checkpoints.sqlite` contains private chats. Generated databases/indexes, `.env`, virtual environments, `node_modules` and build output are ignored by Git. A fresh clone must create local indexes; back up checkpoints separately to preserve chats across migration.
 
-The custom loader verifies all expected chapter/verse keys and pairs translations by key. The loader emits one complete ayah per document, so no splitter is needed. Semantic retrieval combines English BM25, English dense, and Arabic dense candidates using reciprocal rank fusion, deduplicates by ayah ID, then fetches both canonical texts from SQLite. Queries are embedded once and searched against both language collections. Literal search never uses top-k retrieval. Surah summaries read the entire chapter, select representative verse IDs from each section of long chapters, and explain their supported teachings. Short chapters are covered in full. Intermediate model prose is never used as source evidence. All 114 surahs resolve from the complete Tanzil catalog using Arabic names, transliterations, English names, or chapter numbers. Ambiguous shared names prompt clarification. Open questions use a general planner without example-specific aliases or narrative ranges. For narratives, hybrid retrieval expands the requested actors into English search terms, filters candidate seeds for direct relevance, and selects contiguous ranges from wider canonical context. Provider errors propagate rather than promoting raw, potentially unrelated hits into answer evidence. Coverage of every occurrence is not guaranteed. Answers use Quran text and its stored translation only. Historical occasions of a surah's revelation receive a statement that this information is not stated in the Quran; no external commentary is fetched. Retrieval candidates are filtered for relevance to the requested actors and actions before generation. Missing requested details cause abstention rather than supplementation from model memory.
+`QDRANT_URL` optionally selects a Qdrant server. With local Qdrant, run one backend worker. A lock serializes graph requests. The current application has no authentication or per-user thread authorization; deployment needs appropriate access controls and production persistence.
 
-## Verification and model execution
-
-```powershell
-.venv/Scripts/python.exe quran-rag-frontend/verify_threads.py
-node quran-rag-frontend/verify_stream.mjs
-npm --prefix quran-rag-frontend run build
-```
-
-These checks verify persistent thread history, SSE transport and the React build.
-They do not establish Quran-answer accuracy or replace live retrieval evaluation.
-
-Groq requests use LangChain's native `with_structured_output`: JSON schema for
-GPT-OSS and tool calling for other configured models. Pydantic validates the
-returned schema. Native `with_retry` retries parsing failures twice at most;
-Groq's client handles its configured request retries. Native `with_fallbacks`
-switches models on quota errors, without hiding unrelated failures or switching
-after a stream has started emitting. `provider.py` only configures these models
-and runnables; no custom JSON extraction or fallback engine is used.
-
-The backend starts with `GROQ_MODEL`, then uses `GROQ_FALLBACK_MODELS` when quota
-is exhausted. The default alternatives are GPT-OSS 20B and Qwen 3.8 27B.
-`GROQ_REVIEW_MODEL` and `GROQ_REVIEW_FALLBACK_MODELS` configure evidence review.
-`GROQ_QWEN_MAX_TOKENS` caps Qwen's default response budget (800 by default),
-so a request does not exceed the current free-tier output-token allowance.
-Quota errors fall back immediately through all configured models, including
-earlier models whose quotas may have recovered since a previous fallback.
-Thematic and narrative search use up to three focused query variants, each combining BM25 and bilingual dense retrieval, then fuse their rankings by reciprocal rank fusion.
-It inspects the bounded pool of up to 80 ranked candidates
-before accepting an answerable topic, retains relevant evidence across batches,
-and selects up to eight distinct supporting verses. A separate reviewer checks
-the primary verses together in one structured response, with one verdict per
-verse. Exact references and literal searches bypass this semantic pipeline.
-Cloudflare reranking is evaluated separately; it is not enabled by default.
-Safeguard and ALLaM are excluded from factual evidence review. Quran-specific
-routing, Arabic morphology, bilingual rank fusion and canonical sentence checks
-remain application logic.
-
-An ayah explanation fetches the selected ayah and one neighboring ayah on either side, clipped to the same chapter. This also applies when the ayah is selected by semantic retrieval. The answer focuses on the requested ayahs and uses neighbors as context. Numeric ranges accept `through`, repeated chapter references, and ranges crossing chapters. Chapter requests support the first or last several verses.
-
-Cloudflare embeds each hybrid query once; both dense collections use that vector.
-
-## Scope
-
-This is a local development backend. Run one worker with local Qdrant; a lock serializes graph requests to protect its single-process persistence resources. No authentication or tenant isolation is included. Keep it bound to localhost. For deployment add authentication, authorize thread ownership, use a Qdrant server and a production checkpointer. Semantic search returns relevant candidates, not a proven exhaustive list. No fine-tuning is included. Arabic word counts use the Quranic Arabic Corpus v0.4 morphology annotations.
-
-Read [Tanzil attribution and translation usage terms](data/ATTRIBUTION.md). Explanations and summaries stay within the supplied Quran translation; they do not provide scholarly tafsir. Never commit .env or checkpoint databases, which contain private chat history.
-
-English indexing resumes from existing vectors; adding Arabic does not discard English progress. Language-specific fingerprints update only changed texts. Ingestion alternates English and Arabic batches and logs cumulative counts for each. Semantic retrieval becomes ready when both collections cover the corpus. Stop the local indexer before opening the API because local Qdrant permits one process at a time.
-
-Word-frequency questions ("how many times does the word … appear?") use original Arabic only. Complete English words or expressions are resolved by the language model to one Arabic dictionary lemma, which is disclosed in the answer. Multiword English expressions do not trigger clarification merely because of their length. Infinitive expressions resolve to verb lemmas; counts include their conjugations and attached clitics, without combining other derived verbs of the same root. Clarification is reserved for genuinely ambiguous meanings or expressions that have no single-lemma Arabic equivalent. The original expression is returned in `word_count.requested_expression`. Search normalization equates the corpus hamza-plus-alif spelling with alif madda. When a translated dictionary headword has no matching corpus lemma, its root can narrow a list of attested lemma candidates; the selected lemma is validated against that list before counting. Root candidates are never pooled into a root count. SQLite deterministically counts the [Quranic Arabic Corpus v0.4](https://corpus.quran.com/) annotations, including attached articles/clitics and inflections of that lemma, excluding other lemmas sharing its root. Occurrences and distinct verses are returned separately in `word_count`. No count is estimated by the LLM or vector retrieval. Explicit "surface" or "written token" requests (and `/search/word/count?word=…&mode=surface`) retain exact written-token matching. Canonical Arabic remains unchanged.
-
-The morphology source is preserved verbatim at `data/morphology/quranic-corpus-morphology-0.4.txt`, including Kais Dukes' copyright, GNU license and Tanzil notices. Obtained from the CLTK mirror of the original corpus download; derived SQLite rows are generated automatically. The source terms and attribution are included in the file. Check [the original download page](https://corpus.quran.com/download/) for updates.
-
-Tanzil opening formulas prepended to ayah 1 are separated into `opening_header` metadata, preserving each source component verbatim. Only numbered ayah text is embedded or counted. Literal results return unnumbered openings separately as `matched_headers`. Arabic phrase search recognizes Uthmani spelling and initial clitics using corpus annotations. The API has no external-commentary source-document field.
-
-Qwen requests use `reasoning_effort="none"` so hidden thinking cannot consume the small output allowance before the JSON result. This is the documented instruct mode in [Groq's Qwen 3.8 documentation](https://console.groq.com/docs/model/qwen/qwen3.8-27b). GPT-OSS remains the preferred model; fallback classification and canonical sentence checks still apply.
-
-Cloudflare text generation and embeddings share the account's Workers AI allowance. API `/chat` returns HTTP 429 with a quota message when text generation is throttled. No automatic paid upgrade is performed. `RAG_SOURCE_MAX_CHARS` controls the canonical source budget; GPT-OSS has a larger context, so the configured budget avoids unnecessary section reduction. Generated story/topic responses return cited canonical verse records, rather than every unused retrieval candidate.
-
-Semantic searches retain the main expanded query alongside up to two alternative queries. `CLOUDFLARE_REVIEW_MODEL` can select a different model from the generator for independent evidence review. Draft reviews identify source actors, recipients and exemption conditions before comparing each assertion with its own cited text, and copy separate exact evidence spans. Malformed review evidence receives at most two bounded corrections of the review, rather than triggering an unnecessary rewrite of the answer. Genuine unsupported draft claims still trigger a bounded answer repair; unverified answers are withheld.
+Response time depends on embedding calls, retrieval breadth, generation and evidence review. Quotas and outages can interrupt requests. Semantic search is not exhaustive, explanations are not canonical Quran text, and the project does not provide scholarly tafsir. Evaluate answers against their cited verses rather than treating successful past tests as a guarantee for all future questions.
