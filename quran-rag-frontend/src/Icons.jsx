@@ -18,3 +18,4 @@ export const ShieldCheck=make(['M12 2l9 4v6c0 5-5 8-9 10-4-2-9-5-9-10V6l9-4','M8
 export const Leaf=make(['M4 20C-1 9 7 2 21 3c0 13-6 21-17 17zM4 20L16 8']);
 export const Star=make(['M12 2l3 6 7 1-5 5 1 8-6-4-6 4 1-8-5-5 7-1z']);
 export const Heart=make(['M12 21L3 12C-3 3 8-1 12 6c4-7 15-3 9 6l-9 9']);
+
